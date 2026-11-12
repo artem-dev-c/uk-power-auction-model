@@ -7,19 +7,21 @@ from scipy.optimize import linprog
 from power_auction.constants import VOLL_GBP_PER_MWH
 from power_auction.market import clear_market, gas_bids_gbp_per_mwh
 
-# The solver works on one long list of unknowns. The list is made of blocks, each holding one
-# value per hour: first a block per gas plant (cheapest first), then the five blocks below.
-RENEWABLES_USED = 0
-CHARGE = 1
-DISCHARGE = 2
-STORED = 3
-UNSERVED = 4
+# Besides the output of each gas plant, the solver chooses these five things in every hour.
+OTHER_UNKNOWNS = ["renewables_used", "charge", "discharge", "stored", "unserved"]
 
 
-def _block(position: int, n_gas_plants: int, n_hours: int) -> slice:
-    """Where one of the five named blocks sits in the list of unknowns."""
-    start = (n_gas_plants + position) * n_hours
-    return slice(start, start + n_hours)
+def _positions(gas_plants: pd.DataFrame, n_hours: int) -> dict[str, slice]:
+    """Where each unknown sits in the solver's one long list.
+
+    The list holds one value per hour for each gas plant, then one value per hour for each of
+    the other unknowns. The result maps a name to its stretch of the list.
+    """
+    names = list(gas_plants.index) + OTHER_UNKNOWNS
+    positions = {}
+    for number, name in enumerate(names):
+        positions[name] = slice(number * n_hours, (number + 1) * n_hours)
+    return positions
 
 
 def build_dispatch_problem(
@@ -35,72 +37,57 @@ def build_dispatch_problem(
     equations that must hold as equations @ unknowns == targets, and the lowest and highest
     value each unknown may take.
     """
+    n_hours = len(hourly)
+    position = _positions(gas_plants, n_hours)
+    n_unknowns = len(position) * n_hours
+
     bids_gbp_per_mwh = gas_bids_gbp_per_mwh(hourly["gas_price_pence_per_therm"], gas_plants)
     renewables_available_mw = hourly["wind_available_mw"] + hourly["solar_available_mw"]
-    n_hours = len(hourly)
-    n_gas_plants = len(gas_plants)
 
-    # The loss is split evenly between charging and discharging.
-    one_way_efficiency = round_trip_efficiency**0.5
+    # Cost: gas costs its bid, unserved demand costs the Value of Lost Load, the rest is free.
+    cost_gbp_per_mwh = np.zeros(n_unknowns)
+    for plant in gas_plants.index:
+        cost_gbp_per_mwh[position[plant]] = bids_gbp_per_mwh[plant]
+    cost_gbp_per_mwh[position["unserved"]] = VOLL_GBP_PER_MWH
 
     # The battery ends the week empty, as it starts, so it cannot use energy it never paid for.
     stored_limit_mwh = np.full(n_hours, energy_mwh)
     stored_limit_mwh[-1] = 0.0
 
-    free = np.zeros(n_hours)
-    cost_blocks = []
-    limit_blocks = []
-    for plant in bids_gbp_per_mwh.columns:
-        cost_blocks.append(bids_gbp_per_mwh[plant])
-        limit_blocks.append(np.full(n_hours, gas_plants.loc[plant, "capacity_mw"]))
-    # The five blocks after the gas plants, in the order named at the top of this file.
-    cost_blocks += [
-        free,  # renewables used
-        free,  # charge
-        free,  # discharge
-        free,  # stored
-        np.full(n_hours, VOLL_GBP_PER_MWH),  # unserved
-    ]
-    limit_blocks += [
-        renewables_available_mw,  # renewables used
-        np.full(n_hours, power_mw),  # charge
-        np.full(n_hours, power_mw),  # discharge
-        stored_limit_mwh,  # stored
-        np.full(n_hours, np.inf),  # unserved
-    ]
-    cost_gbp_per_mwh = np.concatenate(cost_blocks)
-    highest = np.concatenate(limit_blocks)
-    limits = np.column_stack([np.zeros(len(highest)), highest])
+    # Limits: every unknown is at least zero and at most the value set here.
+    highest = np.zeros(n_unknowns)
+    for plant in gas_plants.index:
+        highest[position[plant]] = gas_plants.loc[plant, "capacity_mw"]
+    highest[position["renewables_used"]] = renewables_available_mw
+    highest[position["charge"]] = power_mw
+    highest[position["discharge"]] = power_mw
+    highest[position["stored"]] = stored_limit_mwh
+    highest[position["unserved"]] = np.inf
+    limits = np.column_stack([np.zeros(n_unknowns), highest])
 
-    # Each block of an equation is an n_hours x n_hours matrix. The identity matrix means
-    # "this unknown, in the same hour"; zeros means the unknown is not in the equation.
+    # Each equation is written once per hour, so an unknown enters it as an n_hours x n_hours
+    # matrix. The identity matrix means "the value in the same hour".
     same_hour = np.eye(n_hours)
-    absent = np.zeros((n_hours, n_hours))
-    # Row t is stored[t] - stored[t-1]. The battery starts empty, so row 0 is just stored[0].
-    change_in_stored = same_hour - np.eye(n_hours, k=-1)
+    previous_hour = np.eye(n_hours, k=-1)
 
-    # In every hour: gas + renewables used - charge + discharge + unserved = demand.
-    supply_meets_demand = np.hstack(
-        [same_hour] * n_gas_plants
-        + [
-            same_hour,  # renewables used
-            -same_hour,  # charge
-            same_hour,  # discharge
-            absent,  # stored
-            same_hour,  # unserved
-        ]
-    )
-    # In every hour: change in stored energy = charge after losses - discharge before losses.
-    battery_energy = np.hstack(
-        [absent] * n_gas_plants
-        + [
-            absent,  # renewables used
-            -one_way_efficiency * same_hour,  # charge
-            same_hour / one_way_efficiency,  # discharge
-            change_in_stored,  # stored
-            absent,  # unserved
-        ]
-    )
+    # Gas + renewables used + discharge + unserved - charge = demand.
+    supply_meets_demand = np.zeros((n_hours, n_unknowns))
+    for plant in gas_plants.index:
+        supply_meets_demand[:, position[plant]] = same_hour
+    supply_meets_demand[:, position["renewables_used"]] = same_hour
+    supply_meets_demand[:, position["discharge"]] = same_hour
+    supply_meets_demand[:, position["unserved"]] = same_hour
+    supply_meets_demand[:, position["charge"]] = -same_hour
+
+    # Stored now - stored an hour ago - charge after losses + discharge before losses = 0.
+    # The loss is split evenly between charging and discharging. In the first hour there is no
+    # hour before, which is the same as starting empty.
+    one_way_efficiency = round_trip_efficiency**0.5
+    battery_energy = np.zeros((n_hours, n_unknowns))
+    battery_energy[:, position["stored"]] = same_hour - previous_hour
+    battery_energy[:, position["charge"]] = -one_way_efficiency * same_hour
+    battery_energy[:, position["discharge"]] = same_hour / one_way_efficiency
+
     equations = np.vstack([supply_meets_demand, battery_energy])
     targets = np.concatenate([hourly["demand_mw"], np.zeros(n_hours)])
 
@@ -126,23 +113,18 @@ def schedule_storage(
     if not cheapest.success:
         raise RuntimeError(cheapest.message)
 
-    n_hours = len(hourly)
-    n_gas_plants = len(gas_plants)
-    charge_block = _block(CHARGE, n_gas_plants, n_hours)
-    discharge_block = _block(DISCHARGE, n_gas_plants, n_hours)
-    stored_block = _block(STORED, n_gas_plants, n_hours)
-
     # Many schedules share the lowest cost: every MWh that relieves a shortfall is worth the
     # same whichever shortfall hour it goes to, yet the hour chosen decides which prices fall.
     # So solve again, holding cost at the lowest, and pick the schedule that stores as little
     # energy for as short a time as possible and never cycles for nothing. The battery then
     # discharges as soon as a shortfall starts and charges as late as it can.
+    position = _positions(gas_plants, len(hourly))
     battery_use = np.zeros(len(cost_gbp_per_mwh))
-    battery_use[charge_block] = 1.0
-    battery_use[discharge_block] = 1.0
-    battery_use[stored_block] = 1.0
+    battery_use[position["charge"]] = 1.0
+    battery_use[position["discharge"]] = 1.0
+    battery_use[position["stored"]] = 1.0
 
-    # With no slack at all, solver rounding makes the second solve infeasible. This much lets
+    # With no slack at all, solver rounding can make the second solve infeasible. This much lets
     # it spend up to about 30p more than the lowest cost over the week, which it does.
     cost_limit_gbp = cheapest.fun * (1 + 1e-9)
     chosen = linprog(
@@ -160,9 +142,9 @@ def schedule_storage(
     unknowns = chosen.x.clip(min=0.0)
     return pd.DataFrame(
         {
-            "storage_charge_mw": unknowns[charge_block],
-            "storage_discharge_mw": unknowns[discharge_block],
-            "storage_energy_mwh": unknowns[stored_block],
+            "storage_charge_mw": unknowns[position["charge"]],
+            "storage_discharge_mw": unknowns[position["discharge"]],
+            "storage_energy_mwh": unknowns[position["stored"]],
         },
         index=hourly.index,
     )

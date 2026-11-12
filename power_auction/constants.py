@@ -20,3 +20,7 @@ DISPATCH_TOLERANCE_MW = 1e-3
 STORAGE_POWER_MW = 2000.0
 STORAGE_ENERGY_MWH = 8000.0
 STORAGE_ROUND_TRIP_EFFICIENCY = 0.85
+
+# Additional analysis: battery sizes to compare, each with the same hours at full power and
+# the same efficiency as the battery above.
+SWEEP_STORAGE_POWER_MW = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]

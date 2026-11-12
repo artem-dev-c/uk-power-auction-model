@@ -13,7 +13,7 @@ from power_auction.constants import (
 )
 from power_auction.data import load_inputs
 from power_auction.market import clear_market
-from power_auction.report import weekly_summary
+from power_auction.report import storage_size_sweep, weekly_summary
 from power_auction.storage import (
     build_dispatch_problem,
     clear_market_with_storage,
@@ -192,6 +192,24 @@ def test_storage_lowers_system_cost_and_unserved_energy(without_storage, with_st
     assert after["unserved_mwh"] == pytest.approx(37494, abs=1)
     assert after["shortfall_hours"] == 23
     assert after["system_cost_gbp"] == pytest.approx(335.104e6, rel=1e-5)
+
+
+def test_size_sweep_matches_the_runs_without_and_with_the_modelled_battery(
+    inputs, without_storage, with_storage
+):
+    hourly, gas_plants = inputs
+    size_sweep = storage_size_sweep(
+        hourly,
+        gas_plants,
+        power_mw_options=[0.0, STORAGE_POWER_MW],
+        hours_at_full_power=STORAGE_ENERGY_MWH / STORAGE_POWER_MW,
+        round_trip_efficiency=STORAGE_ROUND_TRIP_EFFICIENCY,
+    )
+    before = weekly_summary(without_storage)
+    after = weekly_summary(with_storage)
+    assert size_sweep.loc[0.0, "unserved_mwh"] == pytest.approx(before["unserved_mwh"])
+    assert size_sweep.loc[0.0, "system_cost_gbp"] == pytest.approx(before["system_cost_gbp"])
+    assert size_sweep.loc[STORAGE_POWER_MW, "unserved_mwh"] == pytest.approx(after["unserved_mwh"])
 
 
 def test_shortfall_hours_with_storage_are_still_priced_at_voll(with_storage):

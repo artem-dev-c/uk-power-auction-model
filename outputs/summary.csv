@@ -6,9 +6,9 @@ curtailed_mwh,35968.73,25969.61
 unserved_mwh,60326.27,37493.5
 shortfall_hours,29.0,23.0
 zero_price_hours,11.0,8.0
-mean_price_outside_shortfall_gbp_per_mwh,62.09,63.48
 gas_cost_gbp,109328525.87,110142812.73
 system_cost_gbp,471286119.39,335103837.16
 consumer_bill_gbp,4124623415.87,3255780440.62
+storage_charge_mwh,0.0,49712.68
 storage_discharge_mwh,0.0,42255.77
 storage_profit_gbp,0.0,118918953.04
