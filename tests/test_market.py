@@ -13,13 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 @pytest.fixture(scope="module")
 def result() -> pd.DataFrame:
     hourly, gas_plants = load_inputs(REPO_ROOT / "data" / "data.xlsx")
-    return clear_market(
-        hourly["demand_mw"],
-        hourly["wind_available_mw"],
-        hourly["solar_available_mw"],
-        hourly["gas_price_pence_per_therm"],
-        gas_plants,
-    )
+    return clear_market(hourly, gas_plants)
 
 
 def test_gas_bid_converts_pence_per_therm_to_gbp_per_mwh():
@@ -32,24 +26,22 @@ def test_gas_bid_converts_pence_per_therm_to_gbp_per_mwh():
 
 def test_small_market_covers_every_case():
     """Two gas plants of 100 MW each and 100 MW of renewables, worked out by hand."""
-    hours = [1, 2, 3, 4, 5]
-    demand_mw = pd.Series([80.0, 150.0, 200.0, 250.0, 350.0], index=hours)
-    wind_available_mw = pd.Series(60.0, index=hours)
-    solar_available_mw = pd.Series(40.0, index=hours)
-    gas_price_pence_per_therm = pd.Series(100.0, index=hours)
+    hourly = pd.DataFrame(
+        {
+            "demand_mw": [80.0, 150.0, 200.0, 250.0, 350.0],
+            "gas_price_pence_per_therm": 100.0,
+            "wind_available_mw": 60.0,
+            "solar_available_mw": 40.0,
+        },
+        index=[1, 2, 3, 4, 5],
+    )
     gas_plants = pd.DataFrame(
         {"capacity_mw": [100, 100], "efficiency": [0.25, 0.5]}, index=["dear", "cheap"]
     )
     cheap_bid = 34.121 / 0.5
     dear_bid = 34.121 / 0.25
 
-    result = clear_market(
-        demand_mw,
-        wind_available_mw,
-        solar_available_mw,
-        gas_price_pence_per_therm,
-        gas_plants,
-    )
+    result = clear_market(hourly, gas_plants)
 
     # Hour 1: renewables exceed demand, so 20 MW is curtailed pro rata and the price is zero.
     assert result.loc[1, "price_gbp_per_mwh"] == 0.0
@@ -133,6 +125,8 @@ def test_supply_plus_unserved_equals_demand_every_hour(result):
     assert difference_mw.abs().max() < 1e-6
 
 
-def test_results_match_saved_output(result):
-    saved = pd.read_csv(REPO_ROOT / "outputs" / "part1_hourly.csv", index_col="hour")
-    pd.testing.assert_frame_equal(result, saved, check_exact=False, atol=1e-3, check_dtype=False)
+def test_results_match_reference_copy(result):
+    reference = pd.read_csv(REPO_ROOT / "tests" / "golden" / "part1_hourly.csv", index_col="hour")
+    pd.testing.assert_frame_equal(
+        result, reference, check_exact=False, rtol=0, atol=1e-3, check_dtype=False
+    )

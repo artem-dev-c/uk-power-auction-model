@@ -3,6 +3,7 @@
 import pandas as pd
 
 from power_auction.constants import (
+    DISPATCH_TOLERANCE_MW,
     PENCE_PER_GBP,
     RENEWABLE_BID_GBP_PER_MWH,
     THERMS_PER_MWH,
@@ -25,18 +26,15 @@ def gas_bids_gbp_per_mwh(
     return pd.DataFrame(bids_gbp_per_mwh)
 
 
-def clear_market(
-    demand_mw: pd.Series,
-    wind_available_mw: pd.Series,
-    solar_available_mw: pd.Series,
-    gas_price_pence_per_therm: pd.Series,
-    gas_plants: pd.DataFrame,
-) -> pd.DataFrame:
+def clear_market(hourly: pd.DataFrame, gas_plants: pd.DataFrame) -> pd.DataFrame:
     """Dispatch cheapest-first in every hour and return one row per hour.
 
     Columns: demand_mw, price_gbp_per_mwh, price_setter, wind_mw, solar_mw, gas_mw,
     curtailed_mw, unserved_mw, gas_cost_gbp.
     """
+    demand_mw = hourly["demand_mw"]
+    wind_available_mw = hourly["wind_available_mw"]
+    solar_available_mw = hourly["solar_available_mw"]
     renewables_available_mw = wind_available_mw + solar_available_mw
 
     # Wind and solar tie at £0. When together they exceed demand, both are scaled back by
@@ -46,7 +44,7 @@ def clear_market(
     solar_mw = solar_available_mw * share_used
     curtailed_mw = (renewables_available_mw - demand_mw).clip(lower=0.0)
 
-    bids_gbp_per_mwh = gas_bids_gbp_per_mwh(gas_price_pence_per_therm, gas_plants)
+    bids_gbp_per_mwh = gas_bids_gbp_per_mwh(hourly["gas_price_pence_per_therm"], gas_plants)
     price_gbp_per_mwh = pd.Series(RENEWABLE_BID_GBP_PER_MWH, index=demand_mw.index)
     price_setter = pd.Series("renewables", index=demand_mw.index)
     gas_mw = pd.Series(0.0, index=demand_mw.index)
@@ -55,10 +53,11 @@ def clear_market(
     still_needed_mw = (demand_mw - renewables_available_mw).clip(lower=0.0)
     for plant in bids_gbp_per_mwh.columns:
         plant_mw = still_needed_mw.clip(upper=gas_plants.loc[plant, "capacity_mw"])
-        is_running = plant_mw > 0
+        is_running = plant_mw > DISPATCH_TOLERANCE_MW
 
         # Plants are visited cheapest first, so the last one to overwrite the price in an
-        # hour is the most expensive plant needed: the marginal bid.
+        # hour is the most expensive plant needed: the marginal bid. If demand is met exactly
+        # when a plant is full, the next plant is not running and does not set the price.
         price_gbp_per_mwh[is_running] = bids_gbp_per_mwh.loc[is_running, plant]
         price_setter[is_running] = plant
 
@@ -67,7 +66,7 @@ def clear_market(
         still_needed_mw = still_needed_mw - plant_mw
 
     unserved_mw = still_needed_mw
-    is_shortfall = unserved_mw > 0
+    is_shortfall = unserved_mw > DISPATCH_TOLERANCE_MW
     price_gbp_per_mwh[is_shortfall] = VOLL_GBP_PER_MWH
     price_setter[is_shortfall] = "shortfall"
 
